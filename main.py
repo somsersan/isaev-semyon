@@ -1,372 +1,405 @@
 """
-Template pipeline for the offline contextual bandit challenge.
+Упрощённое решение для Contextual Bandit задачи.
 
-Key entry points:
-    * load_data             — read train/test CSVs.
-    * build_preprocessor    — ColumnTransformer for numeric/binary/categorical blocks.
-    * fit_reward_models     — train action-conditional reward estimators q̂(x, a).
-    * make_policy           — convert q̂ scores into a stochastic policy via softmax+ε.
-    * snips / best_static_ips — offline evaluation helpers.
-    * predict_policy        — produce action probabilities for the test set.
-    * save_submission       — persist predictions in the required format.
-
-The main() function wires everything together and exposes useful CLI arguments.
+Основные принципы:
+1. Минималистичный подход - только проверенные методы
+2. Конфигурация через config.yaml
+3. Простая логистическая регрессия как baseline
+4. Без переусложнения
 """
-from __future__ import annotations
-
-import argparse
 import logging
 import os
 import random
-from dataclasses import dataclass
-from itertools import product
-from typing import Dict, Iterable, List, Tuple
+from pathlib import Path
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, clone
+import yaml
 from sklearn.compose import ColumnTransformer
-from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-
-# Core columns/constants used across the pipeline
+# Константы
 ID_COL = "id"
 ACTION_COL = "segment"
 REWARD_COL = "visit"
-ACTIONS: Tuple[str, ...] = ("Mens E-Mail", "Womens E-Mail", "No E-Mail")
+ACTIONS = ("Mens E-Mail", "Womens E-Mail", "No E-Mail")
 ACTION_TO_INDEX = {action: idx for idx, action in enumerate(ACTIONS)}
 
+# Базовые признаки
 NUMERIC_FEATURES = ["recency", "history"]
 BINARY_FEATURES = ["mens", "womens", "newbie"]
 CATEGORICAL_FEATURES = ["zip_code", "channel", "history_segment"]
 
 
-@dataclass
-class Config:
-    train_path: str
-    test_path: str
-    submission_path: str
-    model_type: str
-    temperature_grid: List[float]
-    epsilon_grid: List[float]
-    seed: int
-    mu: float
-    log_level: str
+def load_config(config_path: str = "config.yaml") -> dict:
+    """Загрузка конфигурации из YAML файла."""
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    return config
 
 
-MODEL_REGISTRY = {
-    "logistic": lambda seed: LogisticRegression(max_iter=2_000, random_state=seed),
-    "random_forest": lambda seed: RandomForestClassifier(
-        n_estimators=500,
-        max_depth=None,
-        random_state=seed,
-        n_jobs=-1,
-    ),
-}
-
-
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Contextual bandit baseline template")
-    parser.add_argument("--train-path", default="data/train.csv", help="Path to train CSV")
-    parser.add_argument("--test-path", default="data/test.csv", help="Path to test CSV")
-    parser.add_argument(
-        "--submission-path",
-        default="results/submission.csv",
-        help="Where to write submission.csv",
-    )
-    parser.add_argument(
-        "--model-type",
-        choices=sorted(MODEL_REGISTRY),
-        default="logistic",
-        help="Reward model family per action",
-    )
-    parser.add_argument(
-        "--temperature-grid",
-        default="1.0",
-        help="Comma-separated list of temperatures T for softmax policy",
-    )
-    parser.add_argument(
-        "--epsilon-grid",
-        default="0.05",
-        help="Comma-separated list of epsilon-mix values for exploration",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Global random seed")
-    parser.add_argument(
-        "--mu",
-        type=float,
-        default=1 / 3,
-        help="Logging policy propensity for observed actions",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Verbosity of logger",
-    )
-    args = parser.parse_args()
-    return Config(
-        train_path=args.train_path,
-        test_path=args.test_path,
-        submission_path=args.submission_path,
-        model_type=args.model_type,
-        temperature_grid=_parse_float_grid(args.temperature_grid),
-        epsilon_grid=_parse_float_grid(args.epsilon_grid),
-        seed=args.seed,
-        mu=args.mu,
-        log_level=args.log_level,
-    )
-
-
-def _parse_float_grid(raw: str) -> List[float]:
-    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
-    if not values:
-        raise ValueError("Temperature/epsilon grid cannot be empty")
-    return values
-
-
-def set_global_determinism(seed: int) -> None:
+def set_seed(seed: int) -> None:
+    """Установка random seed для воспроизводимости."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
 
 
-def load_data(train_path: str, test_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    logging.info("Loading data from %s and %s", train_path, test_path)
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    return train_df, test_df
-
-
-def build_preprocessor() -> ColumnTransformer:
-    return ColumnTransformer(
-        transformers=[
-            ("num", StandardScaler(), NUMERIC_FEATURES),
-            ("bin", "passthrough", BINARY_FEATURES),
-            (
-                "cat",
-                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                CATEGORICAL_FEATURES,
-            ),
-        ],
-        remainder="drop",
-        sparse_threshold=0.0,
-    )
-
-
-def _make_estimator(model_type: str, seed: int) -> BaseEstimator:
-    if model_type not in MODEL_REGISTRY:
-        raise KeyError(f"Unknown model type {model_type}. Options: {list(MODEL_REGISTRY)}")
-    return MODEL_REGISTRY[model_type](seed)
-
-
-def fit_reward_models(
-    train_df: pd.DataFrame,
-    preprocessor: ColumnTransformer,
-    model_type: str,
-    seed: int,
-) -> Dict[str, Pipeline]:
-    models: Dict[str, Pipeline] = {}
-    for action in ACTIONS:
-        mask = train_df[ACTION_COL] == action
-        if not mask.any():
-            raise ValueError(f"No training rows for action {action}")
-        y = train_df.loc[mask, REWARD_COL]
-        if y.nunique() == 1:
-            logging.warning(
-                "Action %s has a single reward class; falling back to DummyClassifier.",
-                action,
-            )
-            estimator: BaseEstimator = DummyClassifier(strategy="constant", constant=y.iloc[0])
-        else:
-            estimator = _make_estimator(model_type, seed)
-        pipeline = Pipeline(
-            steps=[
-                ("preprocess", clone(preprocessor)),
-                ("model", estimator),
-            ]
-        )
-        pipeline.fit(train_df.loc[mask], y)
-        models[action] = pipeline
-        logging.info("Fitted reward model for %s on %d rows", action, mask.sum())
-    return models
-
-
-def _predict_q_values(df: pd.DataFrame, models: Dict[str, Pipeline]) -> np.ndarray:
-    q_columns = []
-    for action in ACTIONS:
-        model = models[action]
-        probs = model.predict_proba(df)[:, 1]
-        q_columns.append(probs)
-    return np.column_stack(q_columns)
-
-
-def make_policy(q_hat: np.ndarray, temperature: float, epsilon: float) -> np.ndarray:
-    if q_hat.ndim != 2 or q_hat.shape[1] != len(ACTIONS):
-        raise ValueError("q_hat must be of shape [n_samples, n_actions]")
-    temp = max(temperature, 1e-6)
-    logits = q_hat / temp
-    logits -= logits.max(axis=1, keepdims=True)
-    exp_logits = np.exp(logits)
-    probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
-    eps = float(np.clip(epsilon, 0.0, 1.0))
-    if eps > 0:
-        probs = (1 - eps) * probs + eps / probs.shape[1]
-    return probs
-
-
-def snips(
-    pi_probs: np.ndarray,
-    a_logged: Iterable[str],
-    rewards: Iterable[float],
-    mu: float | np.ndarray = 1 / 3,
-) -> float:
-    a_logged = np.asarray(list(a_logged))
-    rewards = np.asarray(list(rewards))
-    idx = np.array([ACTION_TO_INDEX.get(action, -1) for action in a_logged], dtype=int)
-    valid = idx >= 0
-    if not np.all(valid):
-        logging.warning("Some logged actions are unknown and will be ignored in SNIPS.")
-    if not valid.any():
-        return 0.0
-    rows = np.where(valid)[0]
-    pi_selected = pi_probs[rows, idx[valid]]
-    mu_vec = (
-        np.full(rows.shape[0], float(mu))
-        if np.isscalar(mu)
-        else np.asarray(mu, dtype=float)[valid]
-    )
-    with np.errstate(divide="ignore", invalid="ignore"):
-        weights = np.divide(pi_selected, mu_vec, out=np.zeros_like(pi_selected), where=mu_vec != 0)
-    denom = weights.sum()
-    if denom == 0:
-        return 0.0
-    return float(np.dot(weights, rewards[valid]) / denom)
-
-
-def best_static_ips(
-    a_logged: Iterable[str],
-    rewards: Iterable[float],
-    mu: float | np.ndarray = 1 / 3,
-) -> float:
-    a_logged = np.asarray(list(a_logged))
-    rewards = np.asarray(list(rewards), dtype=float)
-    best = -np.inf
-    for action in ACTIONS:
-        mask = a_logged == action
-        if not mask.any():
-            continue
-        if np.isscalar(mu):
-            mu_vec = float(mu)
-            numerator = rewards[mask].sum() / mu_vec
-            denominator = mask.sum() / mu_vec
-        else:
-            mu_vals = np.asarray(mu, dtype=float)[mask]
-            numerator = np.sum(rewards[mask] / mu_vals)
-            denominator = np.sum(1.0 / mu_vals)
-        value = numerator / denominator if denominator else 0.0
-        best = max(best, value)
-    return best if np.isfinite(best) else 0.0
-
-
-def predict_policy(
-    df: pd.DataFrame,
-    models: Dict[str, Pipeline],
-    temperature: float,
-    epsilon: float,
-) -> np.ndarray:
-    q_hat = _predict_q_values(df, models)
-    return make_policy(q_hat, temperature, epsilon)
-
-
-def save_submission(submission_df: pd.DataFrame, path: str) -> str:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    submission_df.to_csv(path, index=False)
-    logging.info("Submission saved to %s", path)
-    return path
-
-
-def select_best_policy(
-    q_hat: np.ndarray,
-    train_df: pd.DataFrame,
-    temperatures: List[float],
-    epsilons: List[float],
-    mu: float,
-) -> Tuple[float, float, float, float]:
-    best_score = -np.inf
-    best_metrics = (temperatures[0], epsilons[0], -np.inf, -np.inf)
-    rewards = train_df[REWARD_COL]
-    actions = train_df[ACTION_COL]
-    static_reference = best_static_ips(actions, rewards, mu)
-    for temp, eps in product(temperatures, epsilons):
-        policy = make_policy(q_hat, temp, eps)
-        value = snips(policy, actions, rewards, mu)
-        score = value - static_reference
-        logging.info(
-            "T=%.3f, eps=%.3f => SNIPS=%.5f, best_static=%.5f, score=%.5f",
-            temp,
-            eps,
-            value,
-            static_reference,
-            score,
-        )
-        if score > best_score:
-            best_score = score
-            best_metrics = (temp, eps, value, static_reference)
-    return (*best_metrics, best_score)
-
-
-def setup_logging(level: str) -> None:
+def setup_logging(level: str = "INFO") -> None:
+    """Настройка логирования."""
     logging.basicConfig(
         format="[%(levelname)s] %(message)s",
         level=getattr(logging, level.upper()),
     )
 
 
-def create_submission(pred_matrix: np.ndarray, ids: Iterable[int]) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            ID_COL: ids,
-            "p_mens_email": pred_matrix[:, ACTION_TO_INDEX["Mens E-Mail"]],
-            "p_womens_email": pred_matrix[:, ACTION_TO_INDEX["Womens E-Mail"]],
-            "p_no_email": pred_matrix[:, ACTION_TO_INDEX["No E-Mail"]],
-        }
+def load_data(config: dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Загрузка train и test данных."""
+    train_df = pd.read_csv(config["data"]["train_path"])
+    test_df = pd.read_csv(config["data"]["test_path"])
+    logging.info(f"Загружено: train={len(train_df)}, test={len(test_df)}")
+    return train_df, test_df
+
+
+def build_preprocessor() -> ColumnTransformer:
+    """
+    Создание препроцессора для признаков.
+    Простой подход без feature engineering.
+    """
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), NUMERIC_FEATURES),
+            ("bin", "passthrough", BINARY_FEATURES),
+            ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEGORICAL_FEATURES),
+        ],
+        remainder="drop",
+        sparse_threshold=0.0,
     )
+    return preprocessor
 
 
-def main() -> None:
-    config = parse_args()
-    setup_logging(config.log_level)
-    set_global_determinism(config.seed)
+def create_model(config: dict):
+    """Создание модели на основе конфига."""
+    model_type = config["model"]["type"]
+    seed = config["seed"]
+    
+    if model_type == "logistic":
+        params = config["model"]["logistic"]
+        return LogisticRegression(
+            max_iter=params["max_iter"],
+            C=params["C"],
+            solver=params["solver"],
+            random_state=seed,
+        )
+    elif model_type == "random_forest":
+        params = config["model"]["random_forest"]
+        return RandomForestClassifier(
+            n_estimators=params["n_estimators"],
+            max_depth=params["max_depth"],
+            min_samples_leaf=params["min_samples_leaf"],
+            min_samples_split=params["min_samples_split"],
+            random_state=seed,
+            n_jobs=-1,
+        )
+    elif model_type == "extra_trees":
+        params = config["model"]["extra_trees"]
+        return ExtraTreesClassifier(
+            n_estimators=params["n_estimators"],
+            max_depth=params["max_depth"],
+            min_samples_leaf=params["min_samples_leaf"],
+            min_samples_split=params["min_samples_split"],
+            bootstrap=False,
+            random_state=seed,
+            n_jobs=-1,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
-    train_df, test_df = load_data(config.train_path, config.test_path)
+
+def fit_reward_models(
+    train_df: pd.DataFrame,
+    preprocessor: ColumnTransformer,
+    config: dict,
+) -> Dict[str, Pipeline]:
+    """
+    Обучение отдельной модели для каждого действия.
+    Direct Method: P(reward=1 | x, action)
+    """
+    models = {}
+    
+    for action in ACTIONS:
+        # Данные для этого действия
+        mask = train_df[ACTION_COL] == action
+        X = train_df.loc[mask]
+        y = train_df.loc[mask, REWARD_COL]
+        
+        # Создание пайплайна
+        model = create_model(config)
+        pipeline = Pipeline([
+            ("preprocess", preprocessor),
+            ("model", model),
+        ])
+        
+        # Обучение
+        pipeline.fit(X, y)
+        models[action] = pipeline
+        
+        logging.info(f"Обучена модель для '{action}': {mask.sum()} примеров, "
+                    f"reward rate = {y.mean():.3f}")
+    
+    return models
+
+
+def predict_q_values(df: pd.DataFrame, models: Dict[str, Pipeline]) -> np.ndarray:
+    """
+    Предсказание Q-значений (вероятностей reward=1) для каждого действия.
+    
+    Returns:
+        Array shape [n_samples, n_actions] с Q(x, a)
+    """
+    q_columns = []
+    for action in ACTIONS:
+        model = models[action]
+        # Вероятность reward=1
+        probs = model.predict_proba(df)[:, 1]
+        q_columns.append(probs)
+    
+    return np.column_stack(q_columns)
+
+
+def make_policy_greedy(
+    q_values: np.ndarray,
+    epsilon: float = 0.05,
+) -> np.ndarray:
+    """
+    Жадная (почти детерминистическая) политика с epsilon-greedy.
+    
+    π(a|x) = 1 - ε,  если a = argmax Q(x,a')
+             ε/n,    иначе
+    
+    Args:
+        q_values: Q-значения shape [n_samples, n_actions]
+        epsilon: Доля для non-greedy действий
+    
+    Returns:
+        Policy probabilities shape [n_samples, n_actions]
+    """
+    n_samples, n_actions = q_values.shape
+    
+    # Жадное действие
+    greedy_actions = np.argmax(q_values, axis=1)
+    
+    # Инициализация с uniform epsilon
+    policy = np.full((n_samples, n_actions), epsilon / n_actions)
+    
+    # Основная вероятность на жадное действие
+    policy[np.arange(n_samples), greedy_actions] += (1.0 - epsilon)
+    
+    # Ренормализация
+    policy = policy / policy.sum(axis=1, keepdims=True)
+    
+    return policy
+
+
+def make_policy_softmax(
+    q_values: np.ndarray,
+    temperature: float = 1.0,
+    min_prob: float = 0.01,
+) -> np.ndarray:
+    """
+    Softmax политика с температурой.
+    
+    π(a|x) = softmax(Q/T)
+    
+    Args:
+        q_values: Q-значения shape [n_samples, n_actions]
+        temperature: Температура для softmax (ниже = более детерминистично)
+        min_prob: Минимальная вероятность для стабильности
+    
+    Returns:
+        Policy probabilities shape [n_samples, n_actions]
+    """
+    # Softmax с температурой
+    logits = q_values / max(temperature, 1e-6)
+    logits = logits - logits.max(axis=1, keepdims=True)  # numerical stability
+    exp_logits = np.exp(logits)
+    probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+    
+    # Клиппинг для стабильности
+    n_actions = probs.shape[1]
+    max_prob = 1.0 - (n_actions - 1) * min_prob
+    probs = np.clip(probs, min_prob, max_prob)
+    
+    # Ренормализация
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    
+    return probs
+
+
+def make_policy(q_values: np.ndarray, config: dict) -> np.ndarray:
+    """
+    Создание политики на основе конфигурации.
+    
+    Args:
+        q_values: Q-значения
+        config: Конфигурация
+    
+    Returns:
+        Policy probabilities
+    """
+    policy_type = config["policy"]["type"]
+    
+    if policy_type == "greedy":
+        return make_policy_greedy(q_values, epsilon=config["policy"]["epsilon"])
+    elif policy_type == "softmax":
+        return make_policy_softmax(
+            q_values,
+            temperature=config["policy"]["temperature"],
+            min_prob=config["policy"]["min_prob"],
+        )
+    else:
+        raise ValueError(f"Unknown policy type: {policy_type}")
+
+
+def snips_score(
+    policy_probs: np.ndarray,
+    actions: pd.Series,
+    rewards: pd.Series,
+    mu: float = 1/3,
+) -> float:
+    """
+    Вычисление SNIPS (Self-Normalized Importance Sampling) метрики.
+    
+    SNIPS = Σ(π(a|x)/μ * r) / Σ(π(a|x)/μ)
+    """
+    actions_arr = actions.values
+    rewards_arr = rewards.values
+    
+    # Индексы действий
+    action_indices = np.array([ACTION_TO_INDEX[a] for a in actions_arr])
+    
+    # π(a_logged | x)
+    pi_logged = policy_probs[np.arange(len(policy_probs)), action_indices]
+    
+    # Важность (importance weights)
+    weights = pi_logged / mu
+    
+    # SNIPS
+    numerator = np.sum(weights * rewards_arr)
+    denominator = np.sum(weights)
+    
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def best_static_policy_value(actions: pd.Series, rewards: pd.Series, mu: float = 1/3) -> float:
+    """
+    Значение лучшей статической политики (выбирает одно действие всегда).
+    Это baseline для сравнения.
+    
+    Best Static IPS = max_a [ E[r | a] ] = max_a [ mean(rewards where action=a) ]
+    """
+    best_value = -np.inf
+    
+    for action in ACTIONS:
+        mask = actions == action
+        if mask.sum() == 0:
+            continue
+        
+        # Среднее вознаграждение для этого действия
+        # IPS оценка: (sum(r)/mu) / (count/mu) = sum(r) / count = mean(r)
+        value = rewards[mask].mean()
+        best_value = max(best_value, value)
+    
+    return best_value
+
+
+def create_submission(policy_probs: np.ndarray, ids: pd.Series) -> pd.DataFrame:
+    """Создание submission файла."""
+    return pd.DataFrame({
+        ID_COL: ids,
+        "p_mens_email": policy_probs[:, ACTION_TO_INDEX["Mens E-Mail"]],
+        "p_womens_email": policy_probs[:, ACTION_TO_INDEX["Womens E-Mail"]],
+        "p_no_email": policy_probs[:, ACTION_TO_INDEX["No E-Mail"]],
+    })
+
+
+def save_submission(submission_df: pd.DataFrame, path: str) -> None:
+    """Сохранение submission файла."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    submission_df.to_csv(path, index=False)
+    logging.info(f"✅ Submission сохранён: {path}")
+
+
+def main():
+    """Главная функция."""
+    # Загрузка конфига
+    config = load_config("config.yaml")
+    
+    # Настройка
+    set_seed(config["seed"])
+    setup_logging(config["logging"]["level"])
+    
+    logging.info("=" * 60)
+    logging.info("CONTEXTUAL BANDIT - SIMPLIFIED BASELINE")
+    logging.info("=" * 60)
+    logging.info(f"Модель: {config['model']['type']}")
+    logging.info(f"Политика: {config['policy']['type']}")
+    if config['policy']['type'] == 'greedy':
+        logging.info(f"Epsilon: {config['policy']['epsilon']}")
+    elif config['policy']['type'] == 'softmax':
+        logging.info(f"Temperature: {config['policy']['temperature']}")
+    logging.info(f"Seed: {config['seed']}")
+    logging.info("=" * 60)
+    
+    # Загрузка данных
+    train_df, test_df = load_data(config)
+    
+    # Препроцессор
     preprocessor = build_preprocessor()
-    models = fit_reward_models(train_df, preprocessor, config.model_type, config.seed)
-
-    train_q_hat = _predict_q_values(train_df, models)
-    temp, eps, snips_value, best_static_value, final_score = select_best_policy(
-        train_q_hat,
-        train_df,
-        config.temperature_grid,
-        config.epsilon_grid,
-        config.mu,
-    )
-    logging.info(
-        "Selected policy: T=%.3f, eps=%.3f (SNIPS=%.5f, best_static=%.5f, score=%.5f)",
-        temp,
-        eps,
-        snips_value,
-        best_static_value,
-        final_score,
-    )
-
-    test_policy = predict_policy(test_df, models, temp, eps)
+    
+    # Обучение моделей (Direct Method)
+    logging.info("\n🔧 Обучение reward моделей...")
+    models = fit_reward_models(train_df, preprocessor, config)
+    
+    # Предсказание Q-значений на train для оценки
+    logging.info("\n📊 Оценка на train данных...")
+    train_q_values = predict_q_values(train_df, models)
+    
+    # Создание политики
+    train_policy = make_policy(train_q_values, config)
+    
+    # Оценка политики
+    snips_value = snips_score(train_policy, train_df[ACTION_COL], train_df[REWARD_COL], config["mu"])
+    best_static = best_static_policy_value(train_df[ACTION_COL], train_df[REWARD_COL], config["mu"])
+    score = snips_value - best_static
+    
+    logging.info(f"\n📈 МЕТРИКИ:")
+    logging.info(f"  SNIPS: {snips_value:.5f}")
+    logging.info(f"  Best Static: {best_static:.5f}")
+    logging.info(f"  Score (SNIPS - Best Static): {score:.5f}")
+    
+    # Предсказание на test
+    logging.info("\n🎯 Генерация submission...")
+    test_q_values = predict_q_values(test_df, models)
+    test_policy = make_policy(test_q_values, config)
+    
+    # Сохранение submission
     submission_df = create_submission(test_policy, test_df[ID_COL])
-    save_submission(submission_df, config.submission_path)
+    save_submission(submission_df, config["data"]["submission_path"])
+    
+    # Статистика политики
+    logging.info(f"\n📊 Статистика политики (test):")
+    for i, action in enumerate(ACTIONS):
+        mean_prob = test_policy[:, i].mean()
+        logging.info(f"  {action}: {mean_prob:.3f} (среднее)")
+    
+    logging.info("\n✅ Готово!")
 
 
 if __name__ == "__main__":
     main()
+
