@@ -1,26 +1,19 @@
 """
-Упрощённое решение для Contextual Bandit задачи.
-
-Основные принципы:
-1. Минималистичный подход - только проверенные методы
-2. Конфигурация через config.yaml
-3. Простая логистическая регрессия как baseline
-4. Без переусложнения
+Основной файл с решением соревнования
+Здесь должен быть весь ваш код для создания предсказаний
 """
 import logging
 import os
 import random
-from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
-import yaml
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 
 # Константы
@@ -99,13 +92,6 @@ class CTRTargetEncoder(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         cols = list(self.columns)
         return self.feature_names_out_ if self.feature_names_out_ is not None else np.array([f"{c}_ctr" for c in cols])
-
-
-def load_config(config_path: str = "config.yaml") -> dict:
-    """Загрузка конфигурации из YAML файла."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return config
 
 
 def set_seed(seed: int) -> None:
@@ -453,27 +439,104 @@ def best_static_policy_value(actions: pd.Series, rewards: pd.Series, mu: float =
     return best_value
 
 
-def create_submission(policy_probs: np.ndarray, ids: pd.Series) -> pd.DataFrame:
-    """Создание submission файла."""
-    return pd.DataFrame({
+def create_submission(predictions):
+    """
+    Пропишите здесь создание файла submission.csv в папку results
+    !!! ВНИМАНИЕ !!! ФАЙЛ должен иметь именно такого названия
+    """
+    # predictions - это кортеж (policy_probs, ids)
+    policy_probs, ids = predictions
+    
+    # Создать пандас таблицу submission
+    submission = pd.DataFrame({
         ID_COL: ids,
         "p_mens_email": policy_probs[:, ACTION_TO_INDEX["Mens E-Mail"]],
         "p_womens_email": policy_probs[:, ACTION_TO_INDEX["Womens E-Mail"]],
         "p_no_email": policy_probs[:, ACTION_TO_INDEX["No E-Mail"]],
     })
-
-
-def save_submission(submission_df: pd.DataFrame, path: str) -> None:
-    """Сохранение submission файла."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    submission_df.to_csv(path, index=False)
-    logging.info(f"✅ Submission сохранён: {path}")
+    
+    os.makedirs('results', exist_ok=True)
+    submission_path = 'results/submission.csv'
+    submission.to_csv(submission_path, index=False)
+    
+    print(f"Submission файл сохранен: {submission_path}")
+    logging.info(f"✅ Submission сохранён: {submission_path}")
+    
+    return submission_path
 
 
 def main():
-    """Главная функция."""
-    # Загрузка конфига
-    config = load_config("config.yaml")
+    """
+    Главная функция программы
+    
+    Вы можете изменять эту функцию под свои нужды,
+    но обязательно вызовите create_submission() в конце!
+    """
+    print("=" * 50)
+    print("Запуск решения соревнования")
+    print("=" * 50)
+    
+    # Конфигурация (все параметры заданы здесь)
+    config = {
+        # Пути к данным
+        "data": {
+            "train_path": "data/train.csv",
+            "test_path": "data/test.csv",
+            "submission_path": "results/submission.csv",
+        },
+        # Random seed для воспроизводимости
+        "seed": 42,
+        # Logging policy propensity (uniform random = 1/3)
+        "mu": 0.3333333333,
+        # Основные параметры модели
+        "model": {
+            # Тип базового алгоритма: 'logistic', 'random_forest', 'extra_trees'
+            "type": "logistic",
+            # Использовать feature engineering (False = только базовые признаки)
+            "use_feature_engineering": False,
+            # Параметры для логистической регрессии
+            "logistic": {
+                "max_iter": 2000,
+                "C": 1.0,
+                "solver": "lbfgs",
+            },
+            # Параметры для Random Forest
+            "random_forest": {
+                "n_estimators": 300,
+                "max_depth": None,
+                "min_samples_leaf": 5,
+                "min_samples_split": 10,
+            },
+            # Параметры для Extra Trees
+            "extra_trees": {
+                "n_estimators": 300,
+                "max_depth": None,
+                "min_samples_leaf": 5,
+                "min_samples_split": 10,
+            },
+        },
+        # Политика (policy)
+        "policy": {
+            # Тип политики: "greedy" или "softmax"
+            "type": "greedy",
+            # Температура для softmax (только если type="softmax")
+            # T < 1: более детерминистично, T = 1: стандартный softmax, T > 1: больше exploration
+            "temperature": 0.1,
+            # Epsilon для epsilon-greedy (только если type="greedy")
+            # Жадная политика: π(a*) = 1 - ε, π(other) = ε / (n_actions - 1)
+            "epsilon": 0.05,
+            # Минимальная вероятность действия (для стабильности SNIPS)
+            "min_prob": 0.01,
+            # Delta для override в RL-обёртке
+            "override_delta": 0.15,
+        },
+        # Логирование
+        "logging": {
+            "level": "INFO",  # DEBUG, INFO, WARNING, ERROR
+            "save_experiment_logs": True,
+            "experiment_dir": "experiments",
+        },
+    }
     
     # Настройка
     set_seed(config["seed"])
@@ -531,8 +594,8 @@ def main():
     logging.info("\n🎯 Генерация submission...")
     test_q_values = predict_q_values(test_df, models)
     # RL-обёртка перед политикой на инференсе
-    override_delta = config.get("policy", {}).get("override_delta", 0.15)
-    epsilon = config.get("policy", {}).get("epsilon", 0.1)
+    override_delta = config["policy"]["override_delta"]
+    epsilon = config["policy"]["epsilon"]
     test_policy = make_rl_wrapped_policy(
         test_q_values,
         baseline_best_action_idx=best_action_idx,
@@ -540,10 +603,6 @@ def main():
         epsilon=epsilon,
         override_delta=override_delta,
     )
-    
-    # Сохранение submission
-    submission_df = create_submission(test_policy, test_df[ID_COL])
-    save_submission(submission_df, config["data"]["submission_path"])
     
     # Выведем предикт: аргмакс действий и первые строки
     pred_actions_idx = np.argmax(test_policy, axis=1)
@@ -569,8 +628,15 @@ def main():
         logging.info(f"  {action}: {mean_prob:.3f} (среднее)")
     
     logging.info("\n✅ Готово!")
+    
+    # Создание submission файла (ОБЯЗАТЕЛЬНО!)
+    predictions = (test_policy, test_df[ID_COL])
+    create_submission(predictions)
+    
+    print("=" * 50)
+    print("Выполнение завершено успешно!")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
     main()
-
